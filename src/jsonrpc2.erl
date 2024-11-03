@@ -36,7 +36,8 @@
 -type request() :: {method(), params(), id() | undefined} | invalid_request.
 -type response() :: {reply, json()} | noreply.
 
--type handlerfun() :: fun((method(), params()) -> json()).
+-type handlerfun() :: fun((method(), params())->json()) |
+                     {fun((method(), params(),any()) -> json()),any()}.
 -type mapfun() :: fun((fun((A) -> B), [A]) -> [B]). % should be the same as lists:map/2
 
 -export_type([json/0, method/0, params/0, id/0, handlerfun/0, mapfun/0,
@@ -46,6 +47,12 @@
 %% encode functions.
 -spec handle(Req::term(), handlerfun(), JsonDecode::fun(), JsonEncode::fun()) ->
     noreply | {reply, term()}.
+handle(Req, {HandlerFun,_}=Handler, JsonDecode, JsonEncode)
+        when is_function(HandlerFun, 3),
+             is_function(JsonDecode, 1),
+             is_function(JsonEncode, 1) ->
+    handle(Req, Handler, fun lists:map/2, JsonDecode, JsonEncode);
+
 handle(Req, HandlerFun, JsonDecode, JsonEncode)
         when is_function(HandlerFun, 2),
              is_function(JsonDecode, 1),
@@ -56,6 +63,29 @@ handle(Req, HandlerFun, JsonDecode, JsonEncode)
 %% encode functions and a custom map function.
 -spec handle(Req::term(), handlerfun(), mapfun(), JsonDecode::fun(),
              JsonEncode::fun()) -> noreply | {reply, term()}.
+handle(Req, {HandlerFun,_}=Handler, MapFun, JsonDecode, JsonEncode)
+        when is_function(HandlerFun, 3),
+             is_function(MapFun, 2),
+             is_function(JsonDecode, 1),
+             is_function(JsonEncode, 1) ->
+    Response = try JsonDecode(Req) of
+        DecodedJson -> handle(DecodedJson, Handler, MapFun)
+    catch
+        _:_ -> {reply, parseerror()}
+    end,
+    case Response of
+        noreply -> noreply;
+        {reply, Reply} ->
+            try JsonEncode(Reply) of
+                EncodedReply -> {reply, EncodedReply}
+            catch _:_ ->
+                error_logger:error_msg("Failed encoding reply as JSON: ~p",
+                                       [Reply]),
+                {reply, Error} = make_standard_error_response(internal_error, null),
+                {reply, JsonEncode(Error)}
+            end
+    end;
+
 handle(Req, HandlerFun, MapFun, JsonDecode, JsonEncode)
         when is_function(HandlerFun, 2),
              is_function(MapFun, 2),
@@ -176,13 +206,14 @@ parse({Req}) ->
     Id      = proplists:get_value(<<"id">>,      Req, undefined),
     case Version =:= <<"2.0">>
            andalso is_binary(Method)
-           andalso (is_list(Params) orelse is_tuple(Params))
+           andalso (is_list(Params) orelse is_tuple(Params) orelse Params==null)
            andalso (Id =:= undefined orelse Id =:= null
                                      orelse is_binary(Id)
                                      orelse is_number(Id)) of
         true ->
             {Method, Params, Id};
         false ->
+            logger:info("invalid req ~p",[Req]),
             invalid_request
     end;
 parse(_) ->
@@ -190,6 +221,30 @@ parse(_) ->
 
 %% @doc Calls the handler function, catches errors and composes a json-rpc response.
 -spec dispatch(request(), handlerfun()) -> response().
+dispatch({Method, Params, Id}, {HandlerFun,Context}) ->
+    try HandlerFun(Method, Params,Context) of
+        Response -> make_result_response(Response, Id)
+    catch
+        throw:E when E == method_not_found; E == invalid_params;
+                     E == internal_error; E == server_error ->
+            make_standard_error_response(E, Id);
+        throw:{E, Data} when E == method_not_found; E == invalid_params;
+                             E == internal_error; E == server_error ->
+            make_standard_error_response(E, Data, Id);
+        throw:{jsonrpc2, Code, Message} when is_integer(Code), is_binary(Message) ->
+            %% Custom error, without data
+            %% -32000 to -32099	Server error Reserved for implementation-defined server-errors.
+            %% The remainder of the space is available for application defined errors.
+            make_error_response(Code, Message, Id);
+        throw:{jsonrpc2, Code, Message, Data} when is_integer(Code), is_binary(Message) ->
+            %% Custom error, with data
+            make_error_response(Code, Message, Data, Id);
+        Class:Error:S ->
+            error_logger:error_msg(
+                "Error in JSON-RPC handler for method ~s with params ~p (id: ~p): ~p:~p from ~p",
+                [Method, Params, Id, Class, Error, S]),
+            make_standard_error_response(internal_error, Id)
+    end;
 dispatch({Method, Params, Id}, HandlerFun) ->
     try HandlerFun(Method, Params) of
         Response -> make_result_response(Response, Id)
